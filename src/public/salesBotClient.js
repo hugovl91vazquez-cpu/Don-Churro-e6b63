@@ -92,7 +92,7 @@ function setupExitIntentListener(customerId) {
     }
 
     // Desktop: detect mouse leaving viewport
-    if (!wixWindow.formFactor === 'Mobile') {
+    if (wixWindow.formFactor !== 'Mobile') {
         document.addEventListener('mouseout', async (e) => {
             if (e.clientY <= 0 && !exitIntentShown) {
                 session.setItem('exitIntentShown', 'true');

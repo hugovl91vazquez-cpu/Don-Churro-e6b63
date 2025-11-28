@@ -58,7 +58,8 @@ $w.onReady(async function () {
 import { 
     displayUpsell, 
     trackProductView, 
-    showUrgencyNotification 
+    showUrgencyNotification,
+    trackAddToCart
 } from 'public/salesBotClient.js';
 import wixLocation from 'wix-location';
 

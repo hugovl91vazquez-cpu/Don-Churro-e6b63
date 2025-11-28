@@ -488,7 +488,7 @@ function renderProductCards(products) {
         html += `
             <div style="min-width: 120px; border: 1px solid #ddd; border-radius: 8px; padding: 8px;">
                 <div style="font-weight: bold; font-size: 12px;">${product.name}</div>
-                <div style="color: #4a90d9; font-weight: bold;">$${product.price?.toFixed(2) || 'N/A'}</div>
+                <div style="color: #4a90d9; font-weight: bold;">$${(product.price ?? 0).toFixed(2)}</div>
                 <a href="${product.productPageUrl || '/shop'}" style="color: #4a90d9; font-size: 11px;">View →</a>
             </div>
         `;
