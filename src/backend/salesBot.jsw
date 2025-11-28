@@ -1,0 +1,452 @@
+/**
+ * Don Churro Sales Bot - Backend Web Module
+ * Wix Velo Backend Module for Maximum Sales Optimization
+ * 
+ * This module handles all server-side logic for the sales bot including:
+ * - Product recommendations
+ * - Cart abandonment recovery
+ * - Customer analytics
+ * - Promotional offers
+ */
+
+import wixData from 'wix-data';
+import wixCrm from 'wix-crm-backend';
+import { triggeredEmails } from 'wix-crm-backend';
+
+/**
+ * Get personalized product recommendations based on customer behavior
+ * @param {string} customerId - The customer's unique identifier
+ * @param {number} limit - Maximum number of recommendations to return
+ * @returns {Promise<Array>} Array of recommended products
+ */
+export async function getPersonalizedRecommendations(customerId, limit = 5) {
+    try {
+        // Get customer's purchase history
+        const purchaseHistory = await wixData.query("Orders")
+            .eq("customerId", customerId)
+            .descending("_createdDate")
+            .limit(20)
+            .find();
+
+        // Get customer's browsing history
+        const browsingHistory = await wixData.query("BrowsingHistory")
+            .eq("customerId", customerId)
+            .descending("timestamp")
+            .limit(50)
+            .find();
+
+        // Extract categories and products from history
+        const purchasedCategories = new Set();
+        const purchasedProductIds = new Set();
+        
+        purchaseHistory.items.forEach(order => {
+            if (order.lineItems) {
+                order.lineItems.forEach(item => {
+                    purchasedProductIds.add(item.productId);
+                    if (item.category) {
+                        purchasedCategories.add(item.category);
+                    }
+                });
+            }
+        });
+
+        // Get trending products in customer's preferred categories
+        let recommendationsQuery = wixData.query("Products")
+            .not(wixData.query("Products").hasSome("_id", Array.from(purchasedProductIds)))
+            .descending("salesCount")
+            .limit(limit);
+
+        if (purchasedCategories.size > 0) {
+            recommendationsQuery = recommendationsQuery.hasSome("category", Array.from(purchasedCategories));
+        }
+
+        const recommendations = await recommendationsQuery.find();
+        
+        return {
+            success: true,
+            recommendations: recommendations.items,
+            source: "personalized"
+        };
+    } catch (error) {
+        console.error("Error getting personalized recommendations:", error);
+        // Fallback to trending products
+        return getTrendingProducts(limit);
+    }
+}
+
+/**
+ * Get trending/best-selling products
+ * @param {number} limit - Maximum number of products to return
+ * @returns {Promise<Object>} Trending products data
+ */
+export async function getTrendingProducts(limit = 5) {
+    try {
+        const trending = await wixData.query("Products")
+            .descending("salesCount")
+            .limit(limit)
+            .find();
+
+        return {
+            success: true,
+            recommendations: trending.items,
+            source: "trending"
+        };
+    } catch (error) {
+        console.error("Error getting trending products:", error);
+        return {
+            success: false,
+            recommendations: [],
+            error: error.message
+        };
+    }
+}
+
+/**
+ * Get cross-sell products based on current cart items
+ * @param {Array} cartItems - Array of product IDs in the cart
+ * @returns {Promise<Array>} Array of cross-sell product suggestions
+ */
+export async function getCrossSellProducts(cartItems) {
+    try {
+        if (!cartItems || cartItems.length === 0) {
+            return { success: true, products: [] };
+        }
+
+        // Get products frequently bought together
+        const crossSellData = await wixData.query("ProductAssociations")
+            .hasSome("productId", cartItems)
+            .descending("associationStrength")
+            .limit(10)
+            .find();
+
+        const crossSellProductIds = crossSellData.items
+            .map(item => item.associatedProductId)
+            .filter(id => !cartItems.includes(id));
+
+        if (crossSellProductIds.length === 0) {
+            return { success: true, products: [] };
+        }
+
+        const crossSellProducts = await wixData.query("Products")
+            .hasSome("_id", crossSellProductIds)
+            .limit(4)
+            .find();
+
+        return {
+            success: true,
+            products: crossSellProducts.items
+        };
+    } catch (error) {
+        console.error("Error getting cross-sell products:", error);
+        return { success: false, products: [], error: error.message };
+    }
+}
+
+/**
+ * Get upsell products (higher value alternatives)
+ * @param {string} productId - Current product being viewed
+ * @returns {Promise<Array>} Array of upsell product suggestions
+ */
+export async function getUpsellProducts(productId) {
+    try {
+        // Get current product details
+        const currentProduct = await wixData.get("Products", productId);
+        
+        if (!currentProduct) {
+            return { success: false, products: [], error: "Product not found" };
+        }
+
+        // Find similar products with higher price (upsell)
+        const upsellProducts = await wixData.query("Products")
+            .eq("category", currentProduct.category)
+            .gt("price", currentProduct.price)
+            .le("price", currentProduct.price * 1.5) // Up to 50% more expensive
+            .ne("_id", productId)
+            .descending("rating")
+            .limit(3)
+            .find();
+
+        return {
+            success: true,
+            products: upsellProducts.items,
+            currentProduct: currentProduct
+        };
+    } catch (error) {
+        console.error("Error getting upsell products:", error);
+        return { success: false, products: [], error: error.message };
+    }
+}
+
+/**
+ * Track cart abandonment for recovery campaigns
+ * @param {string} customerId - Customer identifier
+ * @param {Array} cartItems - Items in the abandoned cart
+ * @param {number} cartTotal - Total value of the cart
+ */
+export async function trackAbandonedCart(customerId, cartItems, cartTotal) {
+    try {
+        const abandonedCart = {
+            customerId: customerId,
+            cartItems: cartItems,
+            cartTotal: cartTotal,
+            abandonedAt: new Date(),
+            recovered: false,
+            emailSent: false,
+            reminderCount: 0
+        };
+
+        await wixData.insert("AbandonedCarts", abandonedCart);
+        
+        return { success: true, message: "Cart abandonment tracked" };
+    } catch (error) {
+        console.error("Error tracking abandoned cart:", error);
+        return { success: false, error: error.message };
+    }
+}
+
+/**
+ * Send cart recovery email to customer
+ * @param {string} abandonedCartId - ID of the abandoned cart record
+ */
+export async function sendCartRecoveryEmail(abandonedCartId) {
+    try {
+        const cart = await wixData.get("AbandonedCarts", abandonedCartId);
+        
+        if (!cart || cart.recovered) {
+            return { success: false, message: "Cart not found or already recovered" };
+        }
+
+        // Get customer contact info
+        const contact = await wixCrm.getContactById(cart.customerId);
+        
+        if (!contact || !contact.emails || contact.emails.length === 0) {
+            return { success: false, message: "Customer email not found" };
+        }
+
+        // Generate discount code for recovery
+        const discountCode = await generateRecoveryDiscount(cart.cartTotal);
+
+        // Send triggered email
+        await triggeredEmails.emailContact(
+            "cart_recovery_email", // Email template ID
+            cart.customerId,
+            {
+                variables: {
+                    customerName: contact.name?.first || "Valued Customer",
+                    cartItems: JSON.stringify(cart.cartItems),
+                    cartTotal: cart.cartTotal.toFixed(2),
+                    discountCode: discountCode,
+                    discountPercent: "10"
+                }
+            }
+        );
+
+        // Update cart record
+        await wixData.update("AbandonedCarts", {
+            ...cart,
+            emailSent: true,
+            reminderCount: cart.reminderCount + 1,
+            lastReminderAt: new Date()
+        });
+
+        return { success: true, message: "Recovery email sent" };
+    } catch (error) {
+        console.error("Error sending cart recovery email:", error);
+        return { success: false, error: error.message };
+    }
+}
+
+/**
+ * Generate a discount code for cart recovery
+ * @param {number} cartTotal - Original cart total
+ * @returns {Promise<string>} Generated discount code
+ */
+async function generateRecoveryDiscount(cartTotal) {
+    const code = `COMEBACK${Date.now().toString(36).toUpperCase()}`;
+    
+    try {
+        await wixData.insert("DiscountCodes", {
+            code: code,
+            discountType: "percentage",
+            discountValue: 10,
+            minOrderAmount: cartTotal * 0.5,
+            expiresAt: new Date(Date.now() + 48 * 60 * 60 * 1000), // 48 hours
+            usageLimit: 1,
+            usedCount: 0,
+            isActive: true
+        });
+        
+        return code;
+    } catch (error) {
+        console.error("Error generating discount code:", error);
+        return "COMEBACK10"; // Fallback to default code
+    }
+}
+
+/**
+ * Get active promotions for display
+ * @returns {Promise<Array>} Array of active promotions
+ */
+export async function getActivePromotions() {
+    try {
+        const now = new Date();
+        
+        const promotions = await wixData.query("Promotions")
+            .le("startDate", now)
+            .ge("endDate", now)
+            .eq("isActive", true)
+            .ascending("priority")
+            .find();
+
+        return {
+            success: true,
+            promotions: promotions.items
+        };
+    } catch (error) {
+        console.error("Error getting promotions:", error);
+        return { success: false, promotions: [], error: error.message };
+    }
+}
+
+/**
+ * Track customer interaction for analytics
+ * @param {string} customerId - Customer identifier
+ * @param {string} interactionType - Type of interaction (view, click, purchase, etc.)
+ * @param {Object} data - Additional interaction data
+ */
+export async function trackCustomerInteraction(customerId, interactionType, data) {
+    try {
+        await wixData.insert("CustomerInteractions", {
+            customerId: customerId,
+            interactionType: interactionType,
+            data: data,
+            timestamp: new Date(),
+            sessionId: data.sessionId || null
+        });
+
+        return { success: true };
+    } catch (error) {
+        console.error("Error tracking interaction:", error);
+        return { success: false, error: error.message };
+    }
+}
+
+/**
+ * Calculate customer lifetime value score
+ * @param {string} customerId - Customer identifier
+ * @returns {Promise<Object>} Customer value metrics
+ */
+export async function getCustomerValueScore(customerId) {
+    try {
+        const orders = await wixData.query("Orders")
+            .eq("customerId", customerId)
+            .find();
+
+        if (orders.items.length === 0) {
+            return {
+                success: true,
+                score: 0,
+                totalSpent: 0,
+                orderCount: 0,
+                avgOrderValue: 0,
+                segment: "new"
+            };
+        }
+
+        const totalSpent = orders.items.reduce((sum, order) => sum + (order.total || 0), 0);
+        const avgOrderValue = totalSpent / orders.items.length;
+        
+        // Calculate score (0-100)
+        let score = 0;
+        score += Math.min(orders.items.length * 10, 30); // Order frequency (max 30)
+        score += Math.min(totalSpent / 100, 40); // Total spent (max 40)
+        score += Math.min(avgOrderValue / 50, 30); // AOV (max 30)
+
+        // Determine customer segment
+        let segment;
+        if (score >= 70) segment = "vip";
+        else if (score >= 40) segment = "loyal";
+        else if (score >= 20) segment = "regular";
+        else segment = "new";
+
+        return {
+            success: true,
+            score: Math.round(score),
+            totalSpent: totalSpent,
+            orderCount: orders.items.length,
+            avgOrderValue: avgOrderValue,
+            segment: segment
+        };
+    } catch (error) {
+        console.error("Error calculating customer value:", error);
+        return { success: false, error: error.message };
+    }
+}
+
+/**
+ * Get personalized offer based on customer segment
+ * @param {string} customerId - Customer identifier
+ * @returns {Promise<Object>} Personalized offer
+ */
+export async function getPersonalizedOffer(customerId) {
+    try {
+        const customerValue = await getCustomerValueScore(customerId);
+        
+        let offer = {
+            type: "discount",
+            title: "",
+            description: "",
+            code: "",
+            value: 0
+        };
+
+        switch (customerValue.segment) {
+            case "vip":
+                offer = {
+                    type: "exclusive",
+                    title: "VIP Exclusive Offer",
+                    description: "As a valued VIP customer, enjoy 20% off your next purchase!",
+                    code: "VIP20",
+                    value: 20
+                };
+                break;
+            case "loyal":
+                offer = {
+                    type: "loyalty",
+                    title: "Loyalty Reward",
+                    description: "Thank you for being a loyal customer! Here's 15% off.",
+                    code: "LOYAL15",
+                    value: 15
+                };
+                break;
+            case "regular":
+                offer = {
+                    type: "appreciation",
+                    title: "Customer Appreciation",
+                    description: "We appreciate you! Enjoy 10% off your order.",
+                    code: "THANKS10",
+                    value: 10
+                };
+                break;
+            case "new":
+            default:
+                offer = {
+                    type: "welcome",
+                    title: "Welcome Offer",
+                    description: "Welcome! Get 5% off your first purchase.",
+                    code: "WELCOME5",
+                    value: 5
+                };
+                break;
+        }
+
+        return {
+            success: true,
+            offer: offer,
+            customerSegment: customerValue.segment
+        };
+    } catch (error) {
+        console.error("Error getting personalized offer:", error);
+        return { success: false, error: error.message };
+    }
+}
